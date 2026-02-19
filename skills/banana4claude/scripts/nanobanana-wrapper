@@ -1,0 +1,251 @@
+#!/bin/bash
+# Nano Banana Pro wrapper for Vertex AI
+# Usage: nanobanana-wrapper <command> <prompt> [options]
+#
+# Commands:
+#   generate - Generate a new image from text prompt
+#   edit     - Edit an existing image with text instructions
+#
+# Options:
+#   --aspect-ratio <ratio> - Aspect ratio (e.g., 1:1, 4:3, 3:4, 16:9, 9:16, 21:9)
+#   --image-size <size>    - Image size (e.g., 4K)
+#   --style <style>        - Style hint (default: modern)
+#   --image <path>         - Input image path (required for edit)
+#   --output-dir <dir>     - Output directory override
+#
+# Environment variables:
+#   GCP_PROJECT_ID       - GCP Project ID (required)
+#   GCP_REGION           - GCP Region (default: us-central1)
+#   NANOBANANA_OUTPUT_DIR - Output directory (default: ./nanobanana-output)
+#   NANOBANANA_MODEL     - Model to use (default: gemini-3-pro-image-preview)
+#                          Options: gemini-3-pro-image-preview (global, high quality)
+#                                   gemini-2.5-flash-image (regional, faster)
+
+set -e
+
+# Parse command and prompt (positional)
+COMMAND="${1:-generate}"
+shift || true
+PROMPT="${1:-}"
+shift || true
+
+# Default values
+STYLE="modern"
+IMAGE_PATH=""
+ASPECT_RATIO=""
+IMAGE_SIZE=""
+OUTPUT_DIR_OVERRIDE=""
+
+# Parse remaining args: support both legacy positional and new --flag style
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --aspect-ratio)
+            ASPECT_RATIO="$2"; shift 2 ;;
+        --image-size)
+            IMAGE_SIZE="$2"; shift 2 ;;
+        --style)
+            STYLE="$2"; shift 2 ;;
+        --image)
+            IMAGE_PATH="$2"; shift 2 ;;
+        --output-dir)
+            OUTPUT_DIR_OVERRIDE="$2"; shift 2 ;;
+        *)
+            # Legacy positional: $1=style, $2=image_path
+            if [ -z "$IMAGE_PATH" ] && [ -f "$1" ]; then
+                IMAGE_PATH="$1"
+            elif [ "$STYLE" = "modern" ]; then
+                STYLE="$1"
+            fi
+            shift ;;
+    esac
+done
+
+# Configuration
+OUTPUT_DIR="${OUTPUT_DIR_OVERRIDE:-${NANOBANANA_OUTPUT_DIR:-./nanobanana-output}}"
+PROJECT_ID="${GCP_PROJECT_ID:-}"
+REGION="${GCP_REGION:-us-central1}"
+MODEL="${NANOBANANA_MODEL:-gemini-3-pro-image-preview}"
+
+# Validate required settings
+if [ -z "$PROJECT_ID" ]; then
+    echo "Error: GCP_PROJECT_ID environment variable is required" >&2
+    echo "Please set it with: export GCP_PROJECT_ID='your-project-id'" >&2
+    exit 1
+fi
+
+if [ -z "$PROMPT" ]; then
+    echo "Error: Prompt is required" >&2
+    echo "Usage: nanobanana-wrapper <generate|edit> <prompt> [--aspect-ratio 4:3] [--image-size 4K] [--image path]" >&2
+    exit 1
+fi
+
+# Build imageConfig JSON fragment
+IMAGE_CONFIG=""
+if [ -n "$ASPECT_RATIO" ] || [ -n "$IMAGE_SIZE" ]; then
+    IMAGE_CONFIG='"imageConfig": {'
+    IC_PARTS=()
+    if [ -n "$ASPECT_RATIO" ]; then
+        IC_PARTS+=("\"aspectRatio\": \"${ASPECT_RATIO}\"")
+    fi
+    if [ -n "$IMAGE_SIZE" ]; then
+        IC_PARTS+=("\"imageSize\": \"${IMAGE_SIZE}\"")
+    fi
+    # Join with comma
+    IMAGE_CONFIG+=$(IFS=','; echo "${IC_PARTS[*]}")
+    IMAGE_CONFIG+='}'
+fi
+
+# Build generationConfig JSON
+if [ -n "$IMAGE_CONFIG" ]; then
+    GENERATION_CONFIG="\"generationConfig\": {\"responseModalities\": [\"IMAGE\"], ${IMAGE_CONFIG}}"
+else
+    GENERATION_CONFIG="\"generationConfig\": {\"responseModalities\": [\"TEXT\", \"IMAGE\"]}"
+fi
+
+# Ensure output directory exists
+mkdir -p "$OUTPUT_DIR"
+
+# Generate timestamp for unique filename
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+RANDOM_SUFFIX=$(openssl rand -hex 4 2>/dev/null || echo "$$")
+OUTPUT_FILE="${OUTPUT_DIR}/image_${TIMESTAMP}_${RANDOM_SUFFIX}.png"
+
+# Get access token (prefer regular gcloud auth, fallback to ADC)
+ACCESS_TOKEN=$(gcloud auth print-access-token 2>/dev/null)
+if [ -z "$ACCESS_TOKEN" ]; then
+    ACCESS_TOKEN=$(gcloud auth application-default print-access-token 2>/dev/null)
+fi
+if [ -z "$ACCESS_TOKEN" ]; then
+    echo "Error: Failed to get access token" >&2
+    echo "Please run: gcloud auth login" >&2
+    exit 1
+fi
+
+# API endpoint - use global endpoint for preview models, regional for stable models
+if [[ "$MODEL" == *"-preview"* ]]; then
+    # Preview models (like gemini-3-pro-image-preview) require global endpoint
+    ENDPOINT="https://aiplatform.googleapis.com/v1/projects/${PROJECT_ID}/locations/global/publishers/google/models/${MODEL}:generateContent"
+else
+    # Stable models use regional endpoint
+    ENDPOINT="https://${REGION}-aiplatform.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/publishers/google/models/${MODEL}:generateContent"
+fi
+
+# Build request payload based on command
+case "$COMMAND" in
+    generate)
+        PAYLOAD="{\"contents\": [{\"role\": \"USER\", \"parts\": [{\"text\": \"${PROMPT}\"}]}], ${GENERATION_CONFIG}}"
+        ;;
+
+    edit)
+        if [ -z "$IMAGE_PATH" ] || [ ! -f "$IMAGE_PATH" ]; then
+            echo "Error: Image file not found for edit command" >&2
+            echo "Usage: nanobanana-wrapper edit <prompt> --image <path> [--aspect-ratio 4:3]" >&2
+            exit 1
+        fi
+
+        # Read and base64 encode the image
+        if command -v base64 &> /dev/null; then
+            if [[ "$OSTYPE" == "darwin"* ]]; then
+                IMAGE_BASE64=$(base64 -i "$IMAGE_PATH")
+            else
+                IMAGE_BASE64=$(base64 -w 0 "$IMAGE_PATH")
+            fi
+        else
+            echo "Error: base64 command not found" >&2
+            exit 1
+        fi
+
+        # Detect mime type
+        case "$IMAGE_PATH" in
+            *.png)  MIME_TYPE="image/png" ;;
+            *.jpg|*.jpeg) MIME_TYPE="image/jpeg" ;;
+            *.gif)  MIME_TYPE="image/gif" ;;
+            *.webp) MIME_TYPE="image/webp" ;;
+            *)      MIME_TYPE="image/png" ;;
+        esac
+
+        PAYLOAD="{\"contents\": [{\"role\": \"USER\", \"parts\": [{\"text\": \"${PROMPT}\"}, {\"inlineData\": {\"mimeType\": \"${MIME_TYPE}\", \"data\": \"${IMAGE_BASE64}\"}}]}], ${GENERATION_CONFIG}}"
+        ;;
+
+    *)
+        echo "Error: Unknown command: $COMMAND" >&2
+        echo "Usage: nanobanana-wrapper <generate|edit> <prompt> [--aspect-ratio 4:3] [--image path]" >&2
+        exit 1
+        ;;
+esac
+
+# Make API request
+RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$ENDPOINT" \
+    -H "Authorization: Bearer $ACCESS_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "$PAYLOAD" 2>&1)
+
+# Extract HTTP status code (last line) and response body
+HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+RESPONSE_BODY=$(echo "$RESPONSE" | sed '$d')
+
+# Check HTTP status
+if [ "$HTTP_CODE" != "200" ]; then
+    echo "Error: API request failed with status $HTTP_CODE" >&2
+    echo "$RESPONSE_BODY" >&2
+    exit 1
+fi
+
+# Extract image data from response and save
+echo "$RESPONSE_BODY" | python3 -c "
+import json
+import sys
+import base64
+import os
+
+try:
+    data = json.load(sys.stdin)
+
+    # Check for API errors
+    if 'error' in data:
+        print(f\"API Error: {data['error'].get('message', 'Unknown error')}\", file=sys.stderr)
+        sys.exit(1)
+
+    # Navigate to image data in response
+    candidates = data.get('candidates', [])
+    if not candidates:
+        print('Error: No candidates in response', file=sys.stderr)
+        print(json.dumps(data, indent=2), file=sys.stderr)
+        sys.exit(1)
+
+    parts = candidates[0].get('content', {}).get('parts', [])
+
+    image_saved = False
+    text_response = ''
+
+    for part in parts:
+        if 'inlineData' in part:
+            image_data = part['inlineData'].get('data', '')
+            if image_data:
+                output_file = os.environ.get('OUTPUT_FILE', '$OUTPUT_FILE')
+                with open(output_file, 'wb') as f:
+                    f.write(base64.b64decode(image_data))
+                image_saved = True
+        elif 'text' in part:
+            text_response = part['text']
+
+    if image_saved:
+        print('$OUTPUT_FILE')
+        if text_response:
+            print(f'Note: {text_response}', file=sys.stderr)
+        sys.exit(0)
+    else:
+        print('Error: No image data found in response', file=sys.stderr)
+        if text_response:
+            print(f'Model response: {text_response}', file=sys.stderr)
+        else:
+            print(json.dumps(data, indent=2), file=sys.stderr)
+        sys.exit(1)
+
+except json.JSONDecodeError as e:
+    print(f'Error: Failed to parse JSON response: {e}', file=sys.stderr)
+    sys.exit(1)
+except Exception as e:
+    print(f'Error: {e}', file=sys.stderr)
+    sys.exit(1)
+" OUTPUT_FILE="$OUTPUT_FILE"
