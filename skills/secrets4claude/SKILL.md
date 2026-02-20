@@ -3,12 +3,15 @@ name: secrets4claude
 description: |
   Securely fetch API keys and credentials from GCP Secret Manager.
   Secrets are retrieved on-demand and never persisted to disk or environment files.
+  Auto-fires when API keys are needed (e.g., before codex exec, external API calls).
 ---
 
 # secrets4claude - Secure Secret Management via GCP Secret Manager
 
 Fetch API keys and credentials securely from GCP Secret Manager during Claude Code sessions.
 Secrets are retrieved on-demand and used inline — never written to files or echoed to the user.
+
+**This skill uses direct secret access only** (`secretAccessor` role). List operations are not available.
 
 ## How It Works
 
@@ -24,31 +27,61 @@ Secrets are used inline in commands or loaded into the current shell session via
 
 2. **Secret Manager API Enabled** — `secretmanager.googleapis.com`
 
-3. **IAM Role** — `roles/secretmanager.secretAccessor`
+3. **IAM Role** — `roles/secretmanager.secretAccessor` (direct access only, no list permission)
 
 4. **ADC Authentication** — `gcloud auth login`
 
-5. **Secrets stored in Secret Manager** — Use the same name as the env var:
-   ```bash
-   echo -n "sk-..." | gcloud secrets create OPENAI_API_KEY --data-file=- --project=your-project-id
-   echo -n "apify_..." | gcloud secrets create APIFY_API_KEY --data-file=- --project=your-project-id
-   ```
+5. **Secrets stored in Secret Manager** with matching env var names
 
 ## Usage
 
 ```
-/secrets4claude load OPENAI_API_KEY APIFY_API_KEY
-/secrets4claude list
-/secrets4claude get OPENAI_API_KEY
+/secrets4claude load OPENAI_API_KEY
+/secrets4claude load openai          # Bundle: loads API_KEY + ORG_ID + PROJECT_ID
+/secrets4claude get SOME_SECRET
 ```
+
+## AUTO-FIRE RULES — MUST FOLLOW
+
+**This skill MUST be invoked automatically** (without user asking) when:
+
+1. **Before `codex exec` / `codex review`**: Always load the `openai` bundle first
+   ```bash
+   eval $(scripts/secret-fetch --bundle openai)
+   ```
+2. **API key error detected**: Command output contains "API key not set", "unauthorized", "401", "403", "invalid_api_key"
+3. **User mentions API keys, credentials, or secrets**
+4. **`.env` file is absent** and environment variables are needed
+5. **Any external API call** that requires authentication
+
+### OpenAI Bundle (always load all 3 together)
+
+When OpenAI credentials are needed, **always** fetch all 3 as a bundle:
+
+| Secret Manager Name | Env Var | Purpose |
+|---|---|---|
+| `OPENAI_API_KEY` | `OPENAI_API_KEY` | API authentication |
+| `OPENAI_ORGANIZATION_ID` | `OPENAI_ORGANIZATION_ID` | Organization scope |
+| `OPENAI_PROJECT_ID` | `OPENAI_PROJECT_ID` | Project scope |
+
+```bash
+eval $(scripts/secret-fetch --bundle openai)
+```
+
+**Never load `OPENAI_API_KEY` alone** — always use the bundle to include Org ID and Project ID.
 
 ## CLI Reference
 
 ```bash
 scripts/secret-fetch <secret-name>                    # Get single value
 scripts/secret-fetch --env <name1> <name2> ...         # Export statements
-scripts/secret-fetch --list                            # List secrets
+scripts/secret-fetch --bundle <bundle-name>            # Export predefined bundle
 ```
+
+### Bundles
+| Bundle | Secrets |
+|--------|---------|
+| `openai` | `OPENAI_API_KEY`, `OPENAI_ORGANIZATION_ID`, `OPENAI_PROJECT_ID` |
 
 ### Environment Variables
 | Variable | Description |
@@ -66,21 +99,19 @@ scripts/secret-fetch --list                            # List secrets
 
 ## Command Patterns
 
-### Load secrets into current shell session
-When the user asks to load secrets, use `eval`:
+### Load OpenAI bundle (most common)
 ```bash
-eval $(scripts/secret-fetch --env OPENAI_API_KEY OPENAI_ORGANIZATION_ID OPENAI_PROJECT_ID)
+eval $(scripts/secret-fetch --bundle openai)
 ```
-This sets the env vars for subsequent commands in the same Bash session.
+
+### Load specific secrets
+```bash
+eval $(scripts/secret-fetch --env APIFY_API_KEY SOME_OTHER_KEY)
+```
 
 ### Use a secret inline (single command)
 ```bash
 APIFY_API_KEY=$(scripts/secret-fetch APIFY_API_KEY) curl -H "Authorization: Bearer $APIFY_API_KEY" ...
-```
-
-### List available secrets
-```bash
-scripts/secret-fetch --list
 ```
 
 ### Fetch a secret for use in another script
@@ -96,27 +127,27 @@ Determine what the user needs:
 | Request | Action |
 |---------|--------|
 | "load" / "set up" / "secrets" + key names | Fetch and eval export statements |
-| "list" / "what secrets" | List available secrets |
+| "load openai" / codex execution | Fetch openai bundle (all 3 keys) |
 | "get" + single key name | Fetch single value for inline use |
 
 ### 2. Execute
 
 Run `secret-fetch` via Bash. **Always suppress output of actual values.**
 
-For loading multiple secrets:
+For the OpenAI bundle:
 ```bash
-eval $(scripts/secret-fetch --env KEY1 KEY2 KEY3)
+eval $(scripts/secret-fetch --bundle openai)
 ```
 
-For listing:
+For specific secrets:
 ```bash
-scripts/secret-fetch --list
+eval $(scripts/secret-fetch --env KEY1 KEY2 KEY3)
 ```
 
 ### 3. Report Results
 
 - Report SUCCESS/FAILURE only — never the actual values
-- Example: "OPENAI_API_KEY, APIFY_API_KEY を読み込みました"
+- Example: "OPENAI_API_KEY, OPENAI_ORGANIZATION_ID, OPENAI_PROJECT_ID を読み込みました"
 - If a secret is not found, report which one failed
 
 ## Storing New Secrets
@@ -135,7 +166,7 @@ echo -n "new-value" | gcloud secrets versions add SECRET_NAME --data-file=- --pr
 
 ### Permission Denied
 ```bash
-# Check IAM
+# Check IAM — need secretAccessor role
 gcloud projects get-iam-policy PROJECT_ID --filter="bindings.role:secretmanager"
 
 # Grant access
@@ -146,11 +177,8 @@ gcloud projects add-iam-policy-binding PROJECT_ID \
 
 ### Secret Not Found
 ```bash
-# List all secrets
-gcloud secrets list --project=PROJECT_ID
-
-# Check if secret exists
-gcloud secrets describe SECRET_NAME --project=PROJECT_ID
+# Try to access directly (no list permission available)
+gcloud secrets versions access latest --secret=SECRET_NAME --project=PROJECT_ID
 ```
 
 ### API Not Enabled
