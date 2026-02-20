@@ -1,0 +1,207 @@
+#!/bin/bash
+# video-analyzer - Analyze video files using Vertex AI Gemini
+# Usage: video-analyzer <video_path> <prompt> [options]
+#
+# Sends the video file natively (not transcribed) to Gemini for multimodal analysis.
+#
+# Options:
+#   --model <model>       - Model ID (default: gemini-2.5-flash)
+#   --gcs-bucket <bucket> - GCS bucket for large file upload (>20MB)
+#   --timeout <seconds>   - Request timeout (default: 300)
+#
+# Environment variables:
+#   GCP_PROJECT_ID          - GCP Project ID (required)
+#   GCP_REGION              - GCP Region (default: us-central1)
+#   VERTEX_ANALYSIS_MODEL   - Model override (default: gemini-2.5-flash)
+#   VERTEX_GCS_TEMP_BUCKET  - GCS bucket for large files
+
+set -e
+
+# Parse positional args
+FILE_PATH="${1:-}"
+shift || true
+PROMPT="${1:-}"
+shift || true
+
+# Default values
+MODEL_OVERRIDE=""
+GCS_BUCKET_OVERRIDE=""
+TIMEOUT="300"
+
+# Parse flags
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --model) MODEL_OVERRIDE="$2"; shift 2 ;;
+        --gcs-bucket) GCS_BUCKET_OVERRIDE="$2"; shift 2 ;;
+        --timeout) TIMEOUT="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+
+# Configuration
+PROJECT_ID="${GCP_PROJECT_ID:-}"
+REGION="${GCP_REGION:-us-central1}"
+MODEL="${MODEL_OVERRIDE:-${VERTEX_ANALYSIS_MODEL:-gemini-2.5-flash}}"
+GCS_BUCKET="${GCS_BUCKET_OVERRIDE:-${VERTEX_GCS_TEMP_BUCKET:-}}"
+MAX_INLINE_BYTES=20971520  # 20MB
+
+# Validate
+if [ -z "$PROJECT_ID" ]; then
+    echo "Error: GCP_PROJECT_ID environment variable is required" >&2
+    echo "Set it with: export GCP_PROJECT_ID='your-project-id'" >&2
+    exit 1
+fi
+
+if [ -z "$FILE_PATH" ] || [ ! -f "$FILE_PATH" ]; then
+    echo "Error: Video file not found: ${FILE_PATH:-<not specified>}" >&2
+    echo "Usage: video-analyzer <video_path> <prompt> [--model gemini-2.5-pro] [--gcs-bucket my-bucket]" >&2
+    exit 1
+fi
+
+if [ -z "$PROMPT" ]; then
+    echo "Error: Prompt is required" >&2
+    echo "Usage: video-analyzer <video_path> <prompt> [--model gemini-2.5-pro]" >&2
+    exit 1
+fi
+
+# Detect MIME type from extension
+case "${FILE_PATH##*.}" in
+    mp4)  MIME_TYPE="video/mp4" ;;
+    avi)  MIME_TYPE="video/x-msvideo" ;;
+    mov)  MIME_TYPE="video/quicktime" ;;
+    mkv)  MIME_TYPE="video/x-matroska" ;;
+    webm) MIME_TYPE="video/webm" ;;
+    wmv)  MIME_TYPE="video/x-ms-wmv" ;;
+    flv)  MIME_TYPE="video/x-flv" ;;
+    3gp)  MIME_TYPE="video/3gpp" ;;
+    *)    MIME_TYPE="video/mp4" ;;
+esac
+
+# Get access token
+ACCESS_TOKEN=$(gcloud auth print-access-token 2>/dev/null || true)
+if [ -z "$ACCESS_TOKEN" ]; then
+    ACCESS_TOKEN=$(gcloud auth application-default print-access-token 2>/dev/null || true)
+fi
+if [ -z "$ACCESS_TOKEN" ]; then
+    echo "Error: Failed to get access token" >&2
+    echo "Run: gcloud auth login" >&2
+    exit 1
+fi
+
+# API endpoint
+ENDPOINT="https://${REGION}-aiplatform.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/publishers/google/models/${MODEL}:generateContent"
+
+# Check file size
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    FILE_SIZE=$(stat -f%z "$FILE_PATH")
+else
+    FILE_SIZE=$(stat -c%s "$FILE_PATH")
+fi
+
+# Determine upload method
+USE_GCS="false"
+GCS_URI=""
+if [ "$FILE_SIZE" -gt "$MAX_INLINE_BYTES" ]; then
+    if [ -n "$GCS_BUCKET" ]; then
+        USE_GCS="true"
+        TIMESTAMP=$(date +%s)
+        RANDOM_SUFFIX=$(openssl rand -hex 4 2>/dev/null || echo "$$")
+        EXT="${FILE_PATH##*.}"
+        GCS_URI="gs://${GCS_BUCKET}/vertex-temp/video_${TIMESTAMP}_${RANDOM_SUFFIX}.${EXT}"
+        echo "Uploading to GCS (file is $(( FILE_SIZE / 1048576 ))MB)..." >&2
+        gcloud storage cp "$FILE_PATH" "$GCS_URI" 2>&1 >&2
+        echo "Upload complete. Analyzing..." >&2
+    else
+        echo "Warning: File is $(( FILE_SIZE / 1048576 ))MB (> 20MB inline limit)." >&2
+        echo "Set VERTEX_GCS_TEMP_BUCKET or use --gcs-bucket for large files." >&2
+        echo "Attempting inline upload anyway..." >&2
+    fi
+fi
+
+# Execute analysis with python3
+export FILE_PATH PROMPT ACCESS_TOKEN ENDPOINT MIME_TYPE TIMEOUT USE_GCS GCS_URI
+python3 << 'PYEOF'
+import json, sys, base64, os
+import urllib.request, urllib.error
+
+file_path = os.environ['FILE_PATH']
+prompt = os.environ['PROMPT']
+access_token = os.environ['ACCESS_TOKEN']
+endpoint = os.environ['ENDPOINT']
+mime_type = os.environ['MIME_TYPE']
+timeout = int(os.environ.get('TIMEOUT', '300'))
+use_gcs = os.environ.get('USE_GCS', 'false') == 'true'
+gcs_uri = os.environ.get('GCS_URI', '')
+
+# Build file part
+if use_gcs and gcs_uri:
+    file_part = {"fileData": {"mimeType": mime_type, "fileUri": gcs_uri}}
+else:
+    with open(file_path, 'rb') as f:
+        file_data = base64.b64encode(f.read()).decode('utf-8')
+    file_part = {"inlineData": {"mimeType": mime_type, "data": file_data}}
+
+payload = {
+    "contents": [{
+        "role": "USER",
+        "parts": [
+            {"text": prompt},
+            file_part
+        ]
+    }],
+    "generationConfig": {
+        "responseModalities": ["TEXT"]
+    }
+}
+
+req = urllib.request.Request(
+    endpoint,
+    data=json.dumps(payload).encode('utf-8'),
+    headers={
+        'Authorization': f'Bearer {access_token}',
+        'Content-Type': 'application/json'
+    },
+    method='POST'
+)
+
+try:
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        result = json.loads(response.read().decode('utf-8'))
+except urllib.error.HTTPError as e:
+    error_body = e.read().decode('utf-8')
+    print(f"Error: API request failed with status {e.code}", file=sys.stderr)
+    try:
+        err = json.loads(error_body)
+        print(json.dumps(err, indent=2), file=sys.stderr)
+    except Exception:
+        print(error_body, file=sys.stderr)
+    sys.exit(1)
+except Exception as e:
+    print(f"Error: Request failed: {e}", file=sys.stderr)
+    sys.exit(1)
+
+candidates = result.get('candidates', [])
+if not candidates:
+    print("Error: No candidates in response", file=sys.stderr)
+    print(json.dumps(result, indent=2), file=sys.stderr)
+    sys.exit(1)
+
+parts = candidates[0].get('content', {}).get('parts', [])
+text_parts = [p['text'] for p in parts if 'text' in p]
+
+if not text_parts:
+    print("Error: No text in response", file=sys.stderr)
+    print(json.dumps(result, indent=2), file=sys.stderr)
+    sys.exit(1)
+
+print('\n'.join(text_parts))
+PYEOF
+
+EXIT_CODE=$?
+
+# Cleanup GCS temp file if used
+if [ "$USE_GCS" = "true" ] && [ -n "$GCS_URI" ]; then
+    gcloud storage rm "$GCS_URI" 2>/dev/null || true
+fi
+
+exit $EXIT_CODE
