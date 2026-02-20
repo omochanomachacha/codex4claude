@@ -49,7 +49,7 @@ scripts/pdf-analyzer <pdf_path> <prompt> [flags]
 ### Flags
 | Flag | Description |
 |------|-------------|
-| `--model <model>` | Gemini model ID (default: gemini-2.5-flash) |
+| `--model <model>` | Gemini model ID (default: gemini-2.5-pro) |
 | `--gcs-bucket <bucket>` | GCS bucket for large file upload |
 | `--timeout <seconds>` | Request timeout in seconds (default: 300) |
 
@@ -58,7 +58,7 @@ scripts/pdf-analyzer <pdf_path> <prompt> [flags]
 |----------|-------------|
 | `GCP_PROJECT_ID` | GCP Project ID (required) |
 | `GCP_REGION` | GCP Region (default: us-central1) |
-| `VERTEX_ANALYSIS_MODEL` | Model override (default: gemini-2.5-flash) |
+| `VERTEX_ANALYSIS_MODEL` | Model override (default: gemini-2.5-pro) |
 | `VERTEX_GCS_TEMP_BUCKET` | GCS bucket for large files |
 
 ## Command Patterns
@@ -141,7 +141,7 @@ The script outputs the analysis text to stdout.
 
 | Model | Best For |
 |-------|----------|
-| `gemini-2.5-flash` | Fast analysis, short docs, simple prompts (default) |
+| `gemini-2.5-pro` | Fast analysis, short docs, simple prompts (default) |
 | `gemini-2.5-pro` | Detailed analysis, long docs, complex reasoning, nuanced extraction |
 
 ## Why Native PDF Input?
