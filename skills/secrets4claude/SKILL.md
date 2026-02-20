@@ -45,14 +45,20 @@ Secrets are used inline in commands or loaded into the current shell session via
 
 **This skill MUST be invoked automatically** (without user asking) when:
 
-1. **Before `codex exec` / `codex review`**: Always load the `openai` bundle first
-   ```bash
-   eval $(scripts/secret-fetch --bundle openai)
-   ```
-2. **API key error detected**: Command output contains "API key not set", "unauthorized", "401", "403", "invalid_api_key"
-3. **User mentions API keys, credentials, or secrets**
-4. **`.env` file is absent** and environment variables are needed
-5. **Any external API call** that requires authentication
+1. **API key error detected**: Command output contains "API key not set", "unauthorized", "401", "403", "invalid_api_key"
+2. **User mentions API keys, credentials, or secrets**
+3. **`.env` file is absent** and environment variables are needed
+4. **Any external API call** (curl, npm scripts, etc.) that requires authentication
+
+### EXCEPTION: Codex CLI
+
+**Codex CLI は secrets4claude で OPENAI_API_KEY を自動セットしない。**
+Codex はサブスクリプション認証（`~/.codex/auth.json`, `codex login`）で動作する。
+`OPENAI_API_KEY` を設定するとサブスクではなく API 課金になるため、通常は設定しない。
+
+Codex の認証エラー時のフォールバック順序：
+1. `codex login` の再実行を案内
+2. それでも失敗 → `secrets4claude --bundle openai` で API キーをフォールバック取得
 
 ### OpenAI Bundle (always load all 3 together)
 

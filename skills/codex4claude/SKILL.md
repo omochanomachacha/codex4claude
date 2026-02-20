@@ -11,6 +11,26 @@ description: |
 Codex CLI is invoked directly, and Claude and Codex engage in multiple rounds of discussion.
 CLI execution (not MCP) enables real-time progress monitoring and flexible control.
 
+## Authentication — サブスクリプション優先
+
+Codex CLI はサブスクリプション認証（`codex login`）で動作する。**API キーは不要。**
+
+### 認証優先順位
+
+1. **サブスクリプション認証（優先）** — `~/.codex/auth.json` に保存済み
+   - `codex login` で認証。この環境では認証済み
+   - `OPENAI_API_KEY` 環境変数は **設定しない**（設定するとサブスクではなく API 課金になる）
+2. **API キー（フォールバック）** — サブスク認証が失敗した場合のみ
+   - `secrets4claude` で `OPENAI_API_KEY` を取得して設定
+
+### 重要: secrets4claude を自動発火しない
+
+Codex 実行時に `secrets4claude` で `OPENAI_API_KEY` を自動セットしてはならない。
+サブスク認証が使われなくなり、API 課金が発生するため。
+認証エラーが出た場合のみ、以下の順序で対処：
+1. `codex login` の再実行を案内
+2. それでも失敗 → `secrets4claude --bundle openai` でフォールバック
+
 ## Usage
 
 ```
@@ -94,7 +114,7 @@ Do not return questions — always complete your own analysis.
 | exit code != 0 | Check stderr file, report error to user |
 | Empty output file | Codex failed to generate a response. Check stderr, simplify prompt and retry |
 | Timeout | Prompt may be too long. Summarize context and retry |
-| API key not set | Guide user to run `codex login` |
+| Auth error / API key not set | 1) `codex login` 再実行を案内 2) 失敗なら `secrets4claude --bundle openai` でフォールバック |
 
 ## Multi-round Discussion Process
 
@@ -304,8 +324,9 @@ Always wrap context in `<context>` tags to tell Codex "only information within t
 
 ## Notes
 
-- Codex execution requires an OpenAI API key (configured in `~/.codex/`)
-- Each round consumes API tokens, so avoid unnecessarily long discussions
+- Codex はサブスクリプション認証で動作する（`~/.codex/auth.json`）。API キーは不要
+- サブスク認証が有効な場合、`OPENAI_API_KEY` を設定すると API 課金になるため設定しないこと
+- Each round consumes tokens, so avoid unnecessarily long discussions
 - Due to `--sandbox read-only`, Codex cannot modify files. Code changes should be done on the Claude side
 - If Codex's response is long, summarize before passing to the next round
 - Always verify no sensitive information (API keys, credentials, .env, etc.) is included before sending
